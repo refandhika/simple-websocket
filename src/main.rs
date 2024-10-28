@@ -3,38 +3,120 @@ use actix_web::rt::spawn;
 use actix_ws::{Message, Session, handle};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::env;
 use log::error;
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
-struct MessagePayload {
-    message: String
+struct ActionPayload {
+    action: String,
+    message: String,
+    room_name: String
 }
 
 
 struct AppState {
-    sessions: Mutex<Vec<Session>>
+    rooms: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    client_rooms: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    sessions: Mutex<HashMap<String, Session>>
 }
 impl AppState {
-    // Broadcast Message To All
-    async fn broadcast_message(&self, message: &str) {
-        println!("Broadcasting text: {message}");
-        let mut sessions = self.sessions.lock().unwrap();
-        for session in sessions.iter_mut() {
-            let _ = session.text(message).await;
+    // Subscribe To Room
+    async fn subscribe_to_room(&self, session_id: String, room_name: &str, mut session: Session) {
+        // Add to a room
+        let mut rooms = self.rooms.lock().unwrap();
+        rooms.entry(room_name.to_string())
+            .or_insert_with(Vec::new)
+            .push(session_id.clone());
+        session
+            .text(format!("Add client to room: {}", room_name))
+            .await
+            .unwrap();
+        // Save room for client
+        let mut client_rooms = self.client_rooms.lock().unwrap();
+        client_rooms
+            .entry(session_id.clone())
+            .or_insert_with(HashSet::new)
+            .insert(room_name.to_string());
+        session
+            .text(format!("Add room {} to list of client {} room", room_name, session_id))
+            .await
+            .unwrap();
+    }
+
+    // Broadcast Message To A Room
+    async fn broadcast_to_room(&self, room_name: &str, message: &str, session: Option<Session>) {
+        println!("Broadcasting text to {room_name}: {message}");
+        match session {
+            Some(mut session) => {
+                let mut rooms = self.rooms.lock().unwrap();
+                if let Some(session_ids) = rooms.get_mut(room_name) {
+                    let mut sessions = self.sessions.lock().unwrap();
+        
+                    for session_id in session_ids {
+                        if let Some(client_session) = sessions.get_mut(session_id) {
+                            let _ = client_session.text(message.to_string()).await;
+                        }
+                    }
+                } else {
+                    session
+                        .text(format!("Room {} does not exist.", room_name))
+                        .await
+                        .unwrap();
+                }
+            },
+            None => {
+
+            }
         }
+    }
+
+    // Unsubscribe From A Room
+    async fn unsubscribe_from_room(&self, session_id: String, room_name: &str, mut session: Session) {
+        // Remove from a room
+        let mut rooms = self.rooms.lock().unwrap();
+        if let Some(clients) = rooms.get_mut(room_name) {
+            clients.retain(|s| *s != session_id);
+            session
+                .text(format!("Remove client from room: {}", room_name))
+                .await
+                .unwrap();
+        }
+        // Remove room from client
+        let mut client_rooms = self.client_rooms.lock().unwrap();
+        if let Some(rooms) = client_rooms.get_mut(&session_id) {
+            rooms.remove(room_name);
+            if rooms.is_empty() {
+                client_rooms.remove(&session_id);
+                session
+                    .text(format!("Remove room {} from client {}", room_name, session_id))
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    // Get List Of Rooms
+    async fn get_client_rooms(&self, session_id: String) -> Vec<String> {
+        let client_rooms = self.client_rooms.lock().unwrap();
+        client_rooms
+            .get(&session_id)
+            .map(|rooms| rooms.iter().cloned().collect())
+            .unwrap_or_else(Vec::new)
     }
 }
 
+
 // `/send` endpoint handler 
-async fn send_message(
-    payload: web::Json<MessagePayload>,
-    data: web::Data<Arc<AppState>>
-) -> impl Responder {
-    data.broadcast_message(&payload.message).await;
-    HttpResponse::Ok().json("Message sent")
-}
+// async fn send_message(
+//     payload: web::Json<ActionPayload>,
+//     data: web::Data<Arc<AppState>>
+// ) -> impl Responder {
+//     data.broadcast_to_room(&payload.room_name, &payload.message).await;
+//     HttpResponse::Ok().json("Message sent")
+// }
 
 
 // Websocket initialization
@@ -46,11 +128,13 @@ async fn ws(
     // Handshake to websocket
     let (response, mut session, mut msg_stream) = handle(&req, body)?;
 
+    let session_id = Uuid::new_v4().to_string();
     let state = data.get_ref().clone();
     {
         let mut sessions = state.sessions.lock().unwrap();
-        sessions.push(session.clone());
+        sessions.insert(session_id.clone(), session.clone());
     }
+    println!("New WebSocket session created with ID: {}", session_id);
 
     // Spawn handler
     spawn(async move {
@@ -64,13 +148,85 @@ async fn ws(
                 Message::Text(msg) => {
                     println!("Got text: {msg}");
 
-                    // Reversing message
-                    let reversed = msg.chars().rev().collect::<String>();
+                    let msg = msg.trim();
 
-                    // Return the reverse only to the sending user
-                    println!("Sending reversed text: {reversed}");
-                    if session.text(reversed).await.is_err() {
-                        error!("Error sending message");
+                    // Handle command
+                    if msg.starts_with('/') {
+                        let mut cmd_args = msg.splitn(2, ' ');
+
+                        match cmd_args.next().unwrap() {
+                            "/subscribe" => {
+                                if let Some(room_name) = cmd_args.next() {
+                                    state.subscribe_to_room(session_id.clone(), room_name, session.clone()).await;
+                                    println!("Subcribed to room: {}", room_name);
+                                } else {
+                                    session
+                                        .text("Please provide a room name to subscribe.")
+                                        .await
+                                        .unwrap();
+                                }
+                            }
+
+                            "/unsubscribe" => {
+                                if let Some(room_name) = cmd_args.next() {
+                                    state.unsubscribe_from_room(session_id.clone(), room_name, session.clone()).await;
+                                    println!("Unsubcribed to room: {}", room_name);
+                                } else {
+                                    session
+                                        .text("Please provide a room name to unsubscribe.")
+                                        .await
+                                        .unwrap();
+                                }
+                            }
+
+                            "/list" => {
+                                println!("Listing subscription...");
+                                session
+                                    .text("Listing subscription...")
+                                    .await
+                                    .unwrap();
+                                let rooms = state.get_client_rooms(session_id.clone()).await;
+                                if rooms.is_empty() {
+                                    session
+                                        .text("No rooms found for this session.")
+                                        .await
+                                        .unwrap();
+                                } else {
+                                    for room in rooms {
+                                        session
+                                            .text(format!("{}", room))
+                                            .await
+                                            .unwrap();
+                                    }
+                                }
+                            }
+
+                            "/send" => {
+                                if let Some(full_args) = cmd_args.next() {
+                                    let mut cmd_msg = full_args.splitn(2, ' ');
+                                    if let (Some(room_name), Some(message)) = (cmd_msg.next(), cmd_msg.next()) {
+                                        let _ = (room_name, message);
+                                        println!("Broadcasting to room {}: {}", room_name, message);
+                                        state.broadcast_to_room(room_name, message, Some(session.clone())).await;
+                                    } else {
+                                        session.text("Please provide a message to broadcast.").await.unwrap();
+                                    }
+                                } else {
+                                    session.text("Please provide a room name to broadcast to.").await.unwrap();
+                                }
+                            }
+
+                            _ => {
+                                session
+                                    .text(format!("!!! unknown command: {msg}"))
+                                    .await
+                                    .unwrap();
+                            }
+                        }
+                    } else {
+                        if session.text(msg).await.is_err() {
+                            error!("Error sending message");
+                        }
                     }
                 },
                 Message::Close(_) => break,
@@ -90,7 +246,9 @@ async fn main() -> std::io::Result<()> {
     env_logger::init();
 
     let state = Arc::new(AppState {
-        sessions: Mutex::new(Vec::new())
+        rooms: Arc::new(Mutex::new(HashMap::new())),
+        client_rooms: Arc::new(Mutex::new(HashMap::new())),
+        sessions: Mutex::new(HashMap::new())
     });
 
     // Binding a Listener
@@ -101,7 +259,7 @@ async fn main() -> std::io::Result<()> {
             .wrap(Logger::default())
             .app_data(web::Data::new(state.clone()))
             .route("/ws", web::get().to(ws))
-            .route("/send", web::post().to(send_message))
+            // .route("/send", web::post().to(send_message))
     })
     .bind(&addr)?
     .run()
