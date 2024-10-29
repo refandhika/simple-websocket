@@ -16,12 +16,22 @@ Available command:
 
 ---
 
-We can also broadcast message via `/send` POST endpoint, here a sample with curl:
+With session ID you get from websocket connection, it also can take request via REST API endpoints:
 
-``` curl -X POST -H "Content-Type: application/json" -d '{"message": "Hello, I'ts A broadcast Message!"}' http://127.0.0.1:8080/send ```
+- `/send`
+``` curl -X POST -H "Content-Type: application/json" -d '{"message": "Hello", "room_name": "testroom", "session_id": "8b7b4572-1753-4625-a2bf-36fc37c3b4db"}' http://127.0.0.1:8080/send ```
+
+- `/subscribe`
+``` curl -X POST -H "Content-Type: application/json" -d '{"message": "Hello", "room_name": "testroom", "session_id": "8b7b4572-1753-4625-a2bf-36fc37c3b4db"}' http://127.0.0.1:8080/send ```
+
+- `/unsubscribe`
+``` curl -X POST -H "Content-Type: application/json" -d '{"message": "", "room_name": "testroom", "session_id": "8b7b4572-1753-4625-a2bf-36fc37c3b4db"}' http://127.0.0.1:8080/unsubscribe ```
+
+- `/list`
+``` curl -X POST -H "Content-Type: application/json" -d '{"message": "", "room_name": "", "session_id": "8b7b4572-1753-4625-a2bf-36fc37c3b4db"}' http://127.0.0.1:8080/list ```
 
 ---
 
 To Do:
-- Add API endpoint for each command 
+- Handle request if missing parameter
 - Reorganize scripts to files

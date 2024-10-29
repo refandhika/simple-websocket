@@ -9,12 +9,19 @@ use std::sync::{Arc, Mutex};
 use std::env;
 use log::error;
 
+// Request
 #[derive(Deserialize, Serialize, Debug, Clone)]
 struct ActionPayload {
-    action: String,
     message: String,
-    room_name: String
+    room_name: String,
+    session_id: String
 }
+
+//Response
+// #[derive(Serialize)]
+// struct SessionResponse {
+//     session_id: String
+// }
 
 
 struct AppState {
@@ -25,7 +32,7 @@ struct AppState {
 impl AppState {
     // Subscribe To Room
     async fn subscribe_to_room(&self, session_id: String, room_name: &str, mut session: Session) {
-        // Add to a room
+        // Add client to a room
         let mut rooms = self.rooms.lock().unwrap();
         rooms.entry(room_name.to_string())
             .or_insert_with(Vec::new)
@@ -47,35 +54,28 @@ impl AppState {
     }
 
     // Broadcast Message To A Room
-    async fn broadcast_to_room(&self, room_name: &str, message: &str, session: Option<Session>) {
+    async fn broadcast_to_room(&self, room_name: &str, message: &str, mut session: Session) {
         println!("Broadcasting text to {room_name}: {message}");
-        match session {
-            Some(mut session) => {
-                let mut rooms = self.rooms.lock().unwrap();
-                if let Some(session_ids) = rooms.get_mut(room_name) {
-                    let mut sessions = self.sessions.lock().unwrap();
-        
-                    for session_id in session_ids {
-                        if let Some(client_session) = sessions.get_mut(session_id) {
-                            let _ = client_session.text(message.to_string()).await;
-                        }
-                    }
-                } else {
-                    session
-                        .text(format!("Room {} does not exist.", room_name))
-                        .await
-                        .unwrap();
-                }
-            },
-            None => {
+        let mut rooms = self.rooms.lock().unwrap();
+        if let Some(session_ids) = rooms.get_mut(room_name) {
+            let mut sessions = self.sessions.lock().unwrap();
 
+            for session_id in session_ids {
+                if let Some(client_session) = sessions.get_mut(session_id) {
+                    let _ = client_session.text(message.to_string()).await;
+                }
             }
+        } else {
+            session
+                .text(format!("Room {} does not exist.", room_name))
+                .await
+                .unwrap();
         }
     }
 
     // Unsubscribe From A Room
     async fn unsubscribe_from_room(&self, session_id: String, room_name: &str, mut session: Session) {
-        // Remove from a room
+        // Remove client from a room
         let mut rooms = self.rooms.lock().unwrap();
         if let Some(clients) = rooms.get_mut(room_name) {
             clients.retain(|s| *s != session_id);
@@ -106,17 +106,78 @@ impl AppState {
             .map(|rooms| rooms.iter().cloned().collect())
             .unwrap_or_else(Vec::new)
     }
+    
+    // Get Session By ID
+    fn get_session_by_id(&self, session_id: String) -> Option<Session> {
+        let sessions = self.sessions.lock().unwrap();
+        if let Some(found_session) = sessions.get(&session_id) {
+            Some(found_session.clone())
+        } else {
+            None
+        }
+    }
 }
 
-
+/** Endpoint Handler **/
 // `/send` endpoint handler 
-// async fn send_message(
-//     payload: web::Json<ActionPayload>,
-//     data: web::Data<Arc<AppState>>
-// ) -> impl Responder {
-//     data.broadcast_to_room(&payload.room_name, &payload.message).await;
-//     HttpResponse::Ok().json("Message sent")
-// }
+async fn send_message(
+    payload: web::Json<ActionPayload>,
+    data: web::Data<Arc<AppState>>
+) -> impl Responder {
+    let curr_session = data.get_session_by_id(payload.session_id.clone());
+
+    match curr_session {
+        Some(curr_session) => {
+            data.broadcast_to_room(&payload.room_name, &payload.message, curr_session).await;
+            HttpResponse::Ok().json("Message sent")
+        }
+        None => {
+            HttpResponse::InternalServerError().json("Fail to get session")
+        }
+    }
+}
+// `/subscribe` endpoint handler 
+async fn subscribe_room(
+    payload: web::Json<ActionPayload>,
+    data: web::Data<Arc<AppState>>
+) -> impl Responder {
+    let curr_session = data.get_session_by_id(payload.session_id.clone());
+    
+    match curr_session {
+        Some(curr_session) => {
+            data.subscribe_to_room(payload.session_id.clone(), &payload.room_name, curr_session).await;
+            HttpResponse::Ok().json(format!("Subscribed to {}", payload.room_name))
+        }
+        None => {
+            HttpResponse::InternalServerError().json("Fail to get session")
+        }
+    }
+}
+// `/unsubscribe` endpoint handler 
+async fn unsubscribe_room(
+    payload: web::Json<ActionPayload>,
+    data: web::Data<Arc<AppState>>
+) -> impl Responder {
+    let curr_session = data.get_session_by_id(payload.session_id.clone());
+    
+    match curr_session {
+        Some(curr_session) => {
+            data.unsubscribe_from_room(payload.session_id.clone(), &payload.room_name, curr_session).await;
+            HttpResponse::Ok().json(format!("Unsubscribed from {}", payload.room_name))
+        }
+        None => {
+            HttpResponse::InternalServerError().json("Fail to get session")
+        }
+    }
+}
+// `/list` endpoint handler 
+async fn get_all_room(
+    payload: web::Json<ActionPayload>,
+    data: web::Data<Arc<AppState>>
+) -> impl Responder {
+    let all_client_room = data.get_client_rooms(payload.session_id.clone()).await;
+    HttpResponse::Ok().json(format!("{}", all_client_room.join(";")))
+}
 
 
 // Websocket initialization
@@ -207,13 +268,21 @@ async fn ws(
                                     if let (Some(room_name), Some(message)) = (cmd_msg.next(), cmd_msg.next()) {
                                         let _ = (room_name, message);
                                         println!("Broadcasting to room {}: {}", room_name, message);
-                                        state.broadcast_to_room(room_name, message, Some(session.clone())).await;
+                                        state.broadcast_to_room(room_name, message, session.clone()).await;
                                     } else {
                                         session.text("Please provide a message to broadcast.").await.unwrap();
                                     }
                                 } else {
                                     session.text("Please provide a room name to broadcast to.").await.unwrap();
                                 }
+                            }
+                            
+                            "/current" => {
+                                let curr_session = session_id.clone();
+                                session
+                                    .text(format!("Your session ID: {}", curr_session))
+                                    .await
+                                    .unwrap();
                             }
 
                             _ => {
@@ -240,6 +309,7 @@ async fn ws(
     Ok(response)
 }
 
+// Main
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env::set_var("RUST_LOG", "actix_web=debug,actix_server=info");
@@ -259,7 +329,10 @@ async fn main() -> std::io::Result<()> {
             .wrap(Logger::default())
             .app_data(web::Data::new(state.clone()))
             .route("/ws", web::get().to(ws))
-            // .route("/send", web::post().to(send_message))
+            .route("/send", web::post().to(send_message))
+            .route("/subscribe", web::post().to(subscribe_room))
+            .route("/unsubscribe", web::post().to(unsubscribe_room))
+            .route("/list", web::post().to(get_all_room))
     })
     .bind(&addr)?
     .run()
